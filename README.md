@@ -31,6 +31,7 @@ For continuous monitoring:
 ```
 
 The first successful run saves `state.json` as a baseline and does not send a change notification. Later runs notify when movies are added to or removed from the matching set.
+Set `notifications.notify_on_first_run: true` in local `config.yaml` if you want the first run to send the current matching list as a Telegram notification.
 
 ## Theatre Filter
 

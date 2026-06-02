@@ -28,6 +28,7 @@ filters:
   future_grace_days: 7
 
 notifications:
+  notify_on_first_run: false
   urls:
     - "tgram://<bot_token>/<chat_id>"
 

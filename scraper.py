@@ -779,7 +779,8 @@ def run_once(config: dict[str, Any], dry_run_notify: bool = False) -> int:
             print("No changes detected.")
         return 0
 
-    if first_run:
+    notify_on_first_run = bool(config.get("notifications", {}).get("notify_on_first_run", False))
+    if first_run and not notify_on_first_run:
         save_json_file(STATE_FILE, state_payload(matches, timezone))
         logging.info("First run: baseline saved without sending a change notification")
         return 0
