@@ -1,0 +1,34 @@
+source: "letterboxd_csi"
+
+letterboxd:
+  # Use either a literal token or env references for client credentials.
+  # access_token: "env:LETTERBOXD_ACCESS_TOKEN"
+  client_id: "env:LETTERBOXD_CLIENT_ID"
+  client_secret: "env:LETTERBOXD_CLIENT_SECRET"
+  base_url: "https://api.letterboxd.com/api/v0"
+
+letterboxd_csi:
+  web_url: "https://letterboxd.com"
+  impersonate: "chrome"
+
+tmdb:
+  # TMDB API Read Access Token is preferred. An api_key also works.
+  bearer_token: "env:TMDB_BEARER_TOKEN"
+  # api_key: "env:TMDB_API_KEY"
+  base_url: "https://api.themoviedb.org/3"
+
+filters:
+  min_rating: 3.5
+  interesting_rating: 4.0
+  release_years_back: 1
+  max_pages: 2
+  per_page: 100
+  region: "US"
+  theatrical_window_days: 90
+  future_grace_days: 7
+
+notifications:
+  urls:
+    - "tgram://<bot_token>/<chat_id>"
+
+timezone: "America/Chicago"
