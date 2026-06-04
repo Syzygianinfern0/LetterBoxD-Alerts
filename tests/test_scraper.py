@@ -132,6 +132,40 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(candidates[0].letterboxd_id, "pEeQ")
         self.assertEqual(candidates[0].letterboxd_url, "https://letterboxd.com/film/project-hail-mary/")
 
+    def test_letterboxd_csi_fetches_mixed_this_week_and_limits_candidates(self):
+        class FakeCSIClient(LetterboxdCSIClient):
+            def __init__(self):
+                super().__init__({})
+                self.requested_urls = []
+
+            def get_text(self, url, referer=None):
+                self.requested_urls.append(url)
+                items = []
+                for index in range(30):
+                    items.append(
+                        f"""
+                        <li class="poster-container" data-average-rating="3.80">
+                          <div class="react-component"
+                               data-postered-identifier='{{"lid":"film{index}","uid":"film:{index}","type":"film"}}'
+                               data-item-slug="movie-{index}"
+                               data-item-name="Movie {index} (2026)"></div>
+                        </li>
+                        """
+                    )
+                return "<ul>" + "".join(items) + "</ul>"
+
+        client = FakeCSIClient()
+
+        candidates = client.fetch_popular_this_week({})
+
+        self.assertEqual(
+            client.requested_urls,
+            ["https://letterboxd.com/csi/films/films-browser-list/popular/this/week/"],
+        )
+        self.assertEqual(len(candidates), 25)
+        self.assertEqual(candidates[0].title, "Movie 0")
+        self.assertEqual(candidates[-1].title, "Movie 24")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -385,30 +385,22 @@ class LetterboxdCSIClient:
         return response.text
 
     def fetch_popular_this_week(self, filters: dict[str, Any]) -> list[FilmCandidate]:
-        max_pages = int(filters.get("max_pages", 2))
-        release_years_back = int(filters.get("release_years_back", 1))
-        current_year = datetime.now().year
-        years = list(range(current_year, current_year - release_years_back - 1, -1))
+        candidate_limit = int(filters.get("candidate_limit", 25))
         candidates: list[FilmCandidate] = []
         seen_keys: set[str] = set()
 
-        for year in years:
-            for page in range(1, max_pages + 1):
-                url = f"{self.base_url}/csi/films/films-browser-list/popular/this/week/year/{year}/page/{page}/"
-                try:
-                    html = self.get_text(url)
-                except Exception as exc:
-                    logging.warning("Letterboxd CSI year %s page %s failed: %s", year, page, exc)
-                    break
-                page_candidates = self.extract_candidates(html)
-                logging.info("Letterboxd CSI year %s page %s returned %d candidates", year, page, len(page_candidates))
-                if not page_candidates:
-                    break
+        url = f"{self.base_url}/csi/films/films-browser-list/popular/this/week/"
+        html = self.get_text(url)
+        page_candidates = self.extract_candidates(html)
+        logging.info("Letterboxd CSI mixed this-week page returned %d candidates", len(page_candidates))
 
-                for candidate in page_candidates:
-                    if candidate.key not in seen_keys:
-                        candidates.append(candidate)
-                        seen_keys.add(candidate.key)
+        for candidate in page_candidates:
+            if candidate.key in seen_keys:
+                continue
+            candidates.append(candidate)
+            seen_keys.add(candidate.key)
+            if len(candidates) >= candidate_limit:
+                break
 
         return candidates
 
