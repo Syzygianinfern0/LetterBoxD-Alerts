@@ -1,4 +1,5 @@
 import argparse
+import html
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ NOTIFICATION_LOG_FILE = os.path.join(LOGS_DIR, "notifications.json")
 LETTERBOXD_BASE_URL = "https://api.letterboxd.com/api/v0"
 LETTERBOXD_WEB_URL = "https://letterboxd.com"
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
+TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w780"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,6 +68,11 @@ class MatchedMovie:
     letterboxd_url: str | None
     tmdb_url: str | None
     theatre_reason: str
+    poster_url: str | None = None
+    genres: list[str] | None = None
+    runtime_minutes: int | None = None
+    overview: str | None = None
+    trailer_url: str | None = None
 
 
 def load_config(path: str = CONFIG_FILE) -> dict[str, Any]:
@@ -525,6 +532,9 @@ class TMDBClient:
             return parse_int(results[0].get("id"))
         return None
 
+    def movie_details(self, tmdb_id: int) -> dict[str, Any]:
+        return self.get(f"/movie/{tmdb_id}", {"append_to_response": "videos", "language": "en-US"})
+
     def theatre_status(
         self,
         candidate: FilmCandidate,
@@ -590,6 +600,34 @@ def theatre_status_from_release_dates(
     return TheatreStatus(False, f"No {region} theatrical release in the configured window", tmdb_id=tmdb_id, tmdb_url=tmdb_url)
 
 
+def first_trailer_url(details: dict[str, Any]) -> str | None:
+    videos = get_path(details, [["videos", "results"]])
+    if not isinstance(videos, list):
+        return None
+
+    youtube_videos = [
+        video
+        for video in videos
+        if isinstance(video, dict) and str(video.get("site", "")).lower() == "youtube" and video.get("key")
+    ]
+    trailers = [video for video in youtube_videos if str(video.get("type", "")).lower() == "trailer"]
+    selected = (trailers or youtube_videos)[0] if youtube_videos else None
+    if not selected:
+        return None
+    return f"https://youtu.be/{selected['key']}"
+
+
+def movie_metadata(details: dict[str, Any]) -> dict[str, Any]:
+    poster_path = details.get("poster_path")
+    return {
+        "poster_url": f"{TMDB_IMAGE_BASE_URL}{poster_path}" if poster_path else None,
+        "genres": [str(genre["name"]) for genre in details.get("genres", []) if isinstance(genre, dict) and genre.get("name")],
+        "runtime_minutes": parse_int(details.get("runtime")),
+        "overview": str(details.get("overview")) if details.get("overview") else None,
+        "trailer_url": first_trailer_url(details),
+    }
+
+
 def build_matches(candidates: list[FilmCandidate], tmdb_client: TMDBClient, filters: dict[str, Any]) -> list[MatchedMovie]:
     region = str(filters.get("region", "US")).upper()
     window_days = int(filters.get("theatrical_window_days", 90))
@@ -604,6 +642,14 @@ def build_matches(candidates: list[FilmCandidate], tmdb_client: TMDBClient, filt
             continue
         if not status.in_theatres:
             continue
+
+        metadata: dict[str, Any] = {}
+        if status.tmdb_id:
+            try:
+                metadata = movie_metadata(tmdb_client.movie_details(status.tmdb_id))
+            except requests.RequestException as exc:
+                logging.warning("TMDB metadata fetch failed for %s: %s", candidate.title, exc)
+
         matches.append(
             MatchedMovie(
                 key=str(status.tmdb_id or candidate.key),
@@ -615,6 +661,7 @@ def build_matches(candidates: list[FilmCandidate], tmdb_client: TMDBClient, filt
                 letterboxd_url=candidate.letterboxd_url,
                 tmdb_url=status.tmdb_url,
                 theatre_reason=status.reason,
+                **metadata,
             )
         )
     return matches
@@ -686,21 +733,169 @@ def build_notification_message(added: list[MatchedMovie], removed: list[dict[str
     return "\n".join(lines).strip()
 
 
-def send_notification(config: dict[str, Any], body: str) -> bool:
+def runtime_text(minutes: int | None) -> str | None:
+    if not minutes:
+        return None
+    hours, mins = divmod(minutes, 60)
+    if hours and mins:
+        return f"{hours}h {mins}m"
+    if hours:
+        return f"{hours}h"
+    return f"{mins}m"
+
+
+def display_date(value: str | None) -> str | None:
+    parsed = parse_date(value)
+    if not parsed:
+        return value
+    return parsed.strftime("%b %d, %Y")
+
+
+def shorten_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3].rstrip() + "..."
+
+
+def build_movie_card_caption(movie: MatchedMovie) -> str:
+    title = html.escape(movie.title)
+    year = html.escape(str(movie.year or "n/a"))
+    lines = [
+        f"🎬 <b>{title} ({year})</b>",
+        f"⭐ <b>Letterboxd:</b> {movie.rating:.2f}",
+        "",
+    ]
+
+    if movie.genres:
+        lines.append(f"🎭 {html.escape(' · '.join(movie.genres))}")
+    runtime = runtime_text(movie.runtime_minutes)
+    if runtime:
+        lines.append(f"⏱ {runtime}")
+    release = display_date(movie.theatrical_release_date)
+    if release:
+        lines.append(f"📅 US theatrical: {html.escape(release)}")
+    if len(lines) > 3:
+        lines.append("")
+
+    if movie.overview:
+        lines.extend([html.escape(shorten_text(movie.overview, 260)), ""])
+    if movie.trailer_url:
+        lines.append(f"🎞 Trailer: {html.escape(movie.trailer_url)}")
+    if movie.letterboxd_url:
+        lines.append(f"📍 Letterboxd: {html.escape(movie.letterboxd_url)}")
+    elif movie.tmdb_url:
+        lines.append(f"📍 TMDB: {html.escape(movie.tmdb_url)}")
+
+    return "\n".join(lines).strip()
+
+
+def parse_tgram_url(url: str) -> tuple[str, str] | None:
+    if not url.startswith("tgram://"):
+        return None
+    token_and_chat = url.removeprefix("tgram://")
+    if "/" not in token_and_chat:
+        return None
+    token, chat_id = token_and_chat.split("/", 1)
+    chat_id = chat_id.split("?", 1)[0].strip("/")
+    if not token or not chat_id:
+        return None
+    return token, chat_id
+
+
+def telegram_api_request(token: str, method: str, data: dict[str, Any]) -> bool:
+    response = requests.post(f"https://api.telegram.org/bot{token}/{method}", data=data, timeout=30)
+    if not response.ok:
+        logging.error("Telegram %s failed: HTTP %s %s", method, response.status_code, response.text)
+        return False
+    payload = response.json()
+    if not payload.get("ok"):
+        logging.error("Telegram %s failed: %s", method, payload)
+        return False
+    return True
+
+
+def send_telegram_movie_card(token: str, chat_id: str, movie: MatchedMovie) -> bool:
+    caption = build_movie_card_caption(movie)
+    if movie.poster_url:
+        return telegram_api_request(
+            token,
+            "sendPhoto",
+            {
+                "chat_id": chat_id,
+                "photo": movie.poster_url,
+                "caption": caption,
+                "parse_mode": "HTML",
+            },
+        )
+    return telegram_api_request(
+        token,
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": caption,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False,
+        },
+    )
+
+
+def send_telegram_notifications(
+    telegram_urls: list[str],
+    body: str,
+    added: list[MatchedMovie],
+    removed: list[dict[str, Any]],
+) -> bool:
+    success = True
+    for url in telegram_urls:
+        parsed = parse_tgram_url(url)
+        if not parsed:
+            logging.error("Unsupported Telegram notification URL")
+            success = False
+            continue
+        token, chat_id = parsed
+        if added:
+            for movie in added:
+                success = send_telegram_movie_card(token, chat_id, movie) and success
+            if removed:
+                removed_body = "Removed:\n" + "\n".join(f"- {movie_line(movie)}" for movie in removed)
+                success = telegram_api_request(token, "sendMessage", {"chat_id": chat_id, "text": removed_body}) and success
+        else:
+            success = telegram_api_request(token, "sendMessage", {"chat_id": chat_id, "text": body}) and success
+    return success
+
+
+def send_notification(
+    config: dict[str, Any],
+    body: str,
+    added: list[MatchedMovie] | None = None,
+    removed: list[dict[str, Any]] | None = None,
+) -> bool:
     urls = config.get("notifications", {}).get("urls", [])
     if not urls:
         logging.info("No notification URLs configured, skipping notification")
         return True
 
-    apobj = Apprise()
-    for url in urls:
-        apobj.add(url)
-    result = apobj.notify(body=body)
+    added = added or []
+    removed = removed or []
+    telegram_urls = [str(url) for url in urls if str(url).startswith("tgram://")]
+    apprise_urls = [str(url) for url in urls if not str(url).startswith("tgram://")]
+    results = []
+
+    if telegram_urls:
+        results.append(send_telegram_notifications(telegram_urls, body, added, removed))
+
+    if apprise_urls:
+        apobj = Apprise()
+        for url in apprise_urls:
+            apobj.add(url)
+        results.append(bool(apobj.notify(body=body)))
+
+    result = all(results)
     if result:
         logging.info("Notification sent")
     else:
         logging.error("Notification failed")
-    return bool(result)
+    return result
 
 
 def print_results(matches: list[MatchedMovie]) -> None:
@@ -790,7 +985,7 @@ def run_once(config: dict[str, Any], dry_run_notify: bool = False) -> int:
         return 0
 
     message = build_notification_message(added, removed, timezone)
-    if send_notification(config, message):
+    if send_notification(config, message, added=added, removed=removed):
         notification_log.append(change_key)
         save_notification_log(notification_log)
         save_json_file(STATE_FILE, state_payload(matches, timezone))
