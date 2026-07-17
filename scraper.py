@@ -383,7 +383,7 @@ class LetterboxdCSIClient:
             impersonate=self.impersonate,
             timeout=30,
             headers={
-                "referer": referer or self.base_url,
+                "referer": referer or f"{self.base_url}/films/",
                 "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "accept-language": "en-US,en;q=0.9",
             },

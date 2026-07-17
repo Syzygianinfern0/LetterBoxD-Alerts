@@ -136,10 +136,10 @@ class ScraperTests(unittest.TestCase):
         class FakeCSIClient(LetterboxdCSIClient):
             def __init__(self):
                 super().__init__({})
-                self.requested_urls = []
+                self.requests = []
 
             def get_text(self, url, referer=None):
-                self.requested_urls.append(url)
+                self.requests.append((url, referer))
                 items = []
                 for index in range(30):
                     items.append(
@@ -159,12 +159,34 @@ class ScraperTests(unittest.TestCase):
         candidates = client.fetch_popular_this_week({})
 
         self.assertEqual(
-            client.requested_urls,
-            ["https://letterboxd.com/csi/films/films-browser-list/popular/this/week/"],
+            client.requests,
+            [("https://letterboxd.com/csi/films/films-browser-list/popular/this/week/", None)],
         )
         self.assertEqual(len(candidates), 25)
         self.assertEqual(candidates[0].title, "Movie 0")
         self.assertEqual(candidates[-1].title, "Movie 24")
+
+    def test_letterboxd_csi_uses_films_page_as_default_referer(self):
+        class FakeResponse:
+            text = "ok"
+
+            def raise_for_status(self):
+                pass
+
+        class FakeSession:
+            def __init__(self):
+                self.headers = None
+
+            def get(self, _url, **kwargs):
+                self.headers = kwargs["headers"]
+                return FakeResponse()
+
+        client = LetterboxdCSIClient({})
+        client.session = FakeSession()
+
+        client.get_text("https://letterboxd.com/csi/example/")
+
+        self.assertEqual(client.session.headers["referer"], "https://letterboxd.com/films/")
 
 
 if __name__ == "__main__":
