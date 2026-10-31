@@ -168,6 +168,7 @@ class ScraperTests(unittest.TestCase):
 
     def test_letterboxd_csi_uses_films_page_as_default_referer(self):
         class FakeResponse:
+            status_code = 200
             text = "ok"
 
             def raise_for_status(self):

@@ -3,8 +3,10 @@ import html
 import json
 import logging
 import os
+import random
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -27,6 +29,12 @@ LETTERBOXD_BASE_URL = "https://api.letterboxd.com/api/v0"
 LETTERBOXD_WEB_URL = "https://letterboxd.com"
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w780"
+
+# Letterboxd intermittently answers scraped requests with 403/429. A single
+# blocked request used to abort the whole daily run, so retry before giving up.
+RETRY_STATUS_CODES = {403, 408, 429, 500, 502, 503, 504}
+MAX_FETCH_ATTEMPTS = 5
+RETRY_BASE_DELAY = 5.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -376,20 +384,67 @@ class LetterboxdCSIClient:
         self.base_url = str(config.get("web_url") or LETTERBOXD_WEB_URL).rstrip("/")
         self.impersonate = str(config.get("impersonate", "chrome"))
         self.session = curl_requests.Session()
+        self.max_attempts = int(config.get("max_attempts", MAX_FETCH_ATTEMPTS))
+        self._warmed_up = False
+
+    def warm_up(self) -> None:
+        """Pick up cookies from a normal page view before hitting /csi/ endpoints."""
+        if self._warmed_up:
+            return
+        self._warmed_up = True
+        try:
+            self.session.get(
+                f"{self.base_url}/films/",
+                impersonate=self.impersonate,
+                timeout=30,
+                headers={"accept-language": "en-US,en;q=0.9"},
+            )
+        except Exception as exc:
+            logging.warning("Letterboxd warm-up request failed, continuing anyway: %s", exc)
 
     def get_text(self, url: str, referer: str | None = None) -> str:
-        response = self.session.get(
-            url,
-            impersonate=self.impersonate,
-            timeout=30,
-            headers={
-                "referer": referer or f"{self.base_url}/films/",
-                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "accept-language": "en-US,en;q=0.9",
-            },
-        )
-        response.raise_for_status()
-        return response.text
+        self.warm_up()
+        last_exc: Exception | None = None
+
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                response = self.session.get(
+                    url,
+                    impersonate=self.impersonate,
+                    timeout=30,
+                    headers={
+                        "referer": referer or f"{self.base_url}/films/",
+                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "accept-language": "en-US,en;q=0.9",
+                    },
+                )
+                status = response.status_code
+                if status in RETRY_STATUS_CODES and attempt < self.max_attempts:
+                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                    logging.warning(
+                        "Letterboxd returned HTTP %s for %s (attempt %d/%d), retrying in %.1fs",
+                        status, url, attempt, self.max_attempts, delay,
+                    )
+                    time.sleep(delay)
+                    # A fresh session drops any cookie the WAF flagged.
+                    self.session = curl_requests.Session()
+                    self._warmed_up = False
+                    self.warm_up()
+                    continue
+                response.raise_for_status()
+                return response.text
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= self.max_attempts:
+                    break
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                logging.warning(
+                    "Letterboxd request for %s failed (attempt %d/%d): %s; retrying in %.1fs",
+                    url, attempt, self.max_attempts, exc, delay,
+                )
+                time.sleep(delay)
+
+        raise RuntimeError(f"Letterboxd request failed after {self.max_attempts} attempts: {url}") from last_exc
 
     def fetch_popular_this_week(self, filters: dict[str, Any]) -> list[FilmCandidate]:
         candidate_limit = int(filters.get("candidate_limit", 25))
@@ -733,6 +788,17 @@ def build_notification_message(added: list[MatchedMovie], removed: list[dict[str
     return "\n".join(lines).strip()
 
 
+def build_latest_message(matches: list[MatchedMovie], timezone: str) -> str:
+    """The current set of matching films, for the on-demand --notify-latest push."""
+    now = datetime.now(ZoneInfo(timezone)).strftime("%b %d, %Y %H:%M %Z")
+    lines = ["Letterboxd theatre-filtered movies (latest)", f"Checked: {now}", ""]
+    if matches:
+        lines.extend(f"- {movie_line(movie)}" for movie in matches)
+    else:
+        lines.append("No movies currently match the configured constraints.")
+    return "\n".join(lines).strip()
+
+
 def runtime_text(minutes: int | None) -> str | None:
     if not minutes:
         return None
@@ -919,7 +985,7 @@ def print_results(matches: list[MatchedMovie]) -> None:
     print(tabulate(rows, headers="keys", tablefmt="grid"))
 
 
-def run_once(config: dict[str, Any], dry_run_notify: bool = False) -> int:
+def run_once(config: dict[str, Any], dry_run_notify: bool = False, notify_latest: bool = False) -> int:
     source = str(config.get("source", "letterboxd_csi"))
     filters = config.get("filters", {})
     timezone = str(config.get("timezone", "America/Chicago"))
@@ -957,6 +1023,15 @@ def run_once(config: dict[str, Any], dry_run_notify: bool = False) -> int:
     previous = load_json_file(STATE_FILE, None)
     added, removed = diff_results(previous, matches)
     first_run = previous is None
+
+    if notify_latest:
+        # On-demand push of the current state. Deliberately leaves state.json and
+        # the notification log untouched so the scheduled change-only alerting
+        # carries on exactly as before.
+        message = build_latest_message(matches, timezone)
+        if send_notification(config, message, added=matches, removed=[]):
+            return 0
+        return 1
 
     if dry_run_notify:
         print("\n--- Dry-run notification ---")
@@ -999,15 +1074,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="List and monitor high-rated Letterboxd popular movies still in theatres.")
     parser.add_argument("--once", action="store_true", help="Run one check and exit. This is the default behavior.")
     parser.add_argument("--dry-run-notify", action="store_true", help="Print the notification body without sending or changing state.")
+    parser.add_argument(
+        "--notify-latest",
+        action="store_true",
+        help="Send the current results to Telegram regardless of whether anything changed, without updating state.",
+    )
     parser.add_argument("--config", default=CONFIG_FILE, help="Path to config YAML.")
     args = parser.parse_args()
 
     try:
         load_env_file()
         config = load_config(args.config)
-        return run_once(config, dry_run_notify=args.dry_run_notify)
+        return run_once(config, dry_run_notify=args.dry_run_notify, notify_latest=args.notify_latest)
     except Exception as exc:
-        logging.error("%s", exc)
+        logging.exception("Run failed: %s", exc)
         return 1
 
 
