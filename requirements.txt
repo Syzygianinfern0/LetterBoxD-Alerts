@@ -1,8 +1,0 @@
-requests
-pyyaml
-apprise
-tabulate
-curl_cffi
-beautifulsoup4
-lxml
-selenium

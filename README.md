@@ -1,6 +1,8 @@
-# Letterboxd Theatre-Filtered Alerts
+<p align="center"><img src="assets/logo.png" alt="LetterBoxD Alerts logo" width="128"></p>
 
-Polls Letterboxd's official API for popular-this-week movies, filters for recent high-rated films, then uses TMDB release-date data to keep only movies with a recent US theatrical or limited-theatrical release. It prints the current matches and can notify through Telegram via Apprise when the matching set changes.
+<h1 align="center">Letterboxd Theatre-Filtered Alerts</h1>
+
+Checks Letterboxd's popular-this-week films once a day, keeps the recent high-rated ones, then uses TMDB release-date data to keep only films with a recent US theatrical or limited-theatrical release. When the matching set changes (and once a week), it sends a leaderboard digest image to Telegram via Apprise.
 
 ## Setup
 
