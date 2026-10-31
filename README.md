@@ -13,6 +13,7 @@ Letterboxd's popular list mixes new releases with classics and stuff that's been
 A daily check, and a message whenever a film joins or leaves the list (plus a weekly roundup on Fridays):
 
 <p align="center"><img src="assets/example-digest.png" alt="Example digest: a leaderboard of highly rated films in theatres" width="520"></p>
+<p align="center"><sub>Example digest rendered with sample trend data.</sub></p>
 
 Each film shows its rating and how it's trending, how many people are watching it each day, its spot on Letterboxd's popular list, and how long it's been in theatres. New arrivals get a **NEW** tag and films already out on digital get a **STREAMING** tag.
 
