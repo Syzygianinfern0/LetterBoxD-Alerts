@@ -19,7 +19,8 @@ from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_requests
 from tabulate import tabulate
 
-from history import FilmTrend, compact_number, film_trend, load_history, render_trend_chart
+from digest_image import render_digest_image
+from history import FilmTrend, compact_number, film_trend, load_history
 
 
 CONFIG_FILE = "config.yaml"
@@ -27,7 +28,7 @@ ENV_FILE = ".env"
 STATE_FILE = "state.json"
 LOGS_DIR = "logs"
 NOTIFICATION_LOG_FILE = os.path.join(LOGS_DIR, "notifications.json")
-CHART_FILE = os.path.join(LOGS_DIR, "trends.png")
+DIGEST_IMAGE_FILE = os.path.join(LOGS_DIR, "digest.png")
 LETTERBOXD_BASE_URL = "https://api.letterboxd.com/api/v0"
 LETTERBOXD_WEB_URL = "https://letterboxd.com"
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
@@ -784,10 +785,28 @@ def state_payload(matches: list[MatchedMovie], timezone: str, last_notified_date
     return payload
 
 
-def save_snapshot(matches: list[MatchedMovie], timezone: str) -> str:
+def save_snapshot(matches: list[MatchedMovie], timezone: str, fetched: list[FilmCandidate] | None = None) -> str:
+    """Write the day's matches, plus every fetched candidate's rank and rating.
+
+    The candidates cost no extra requests and keep a record of the films that
+    narrowly missed the filters, for later analysis.
+    """
     now = datetime.now(ZoneInfo(timezone))
     filename = os.path.join(LOGS_DIR, f"results_{now.strftime('%Y%m%d_%H%M%S')}.json")
-    save_json_file(filename, state_payload(matches, timezone))
+    payload = state_payload(matches, timezone)
+    if fetched is not None:
+        payload["candidates"] = [
+            {
+                "key": c.key,
+                "title": c.title,
+                "year": c.year,
+                "rating": c.rating,
+                "popularity_rank": c.popularity_rank,
+                "letterboxd_url": c.letterboxd_url,
+            }
+            for c in fetched
+        ]
+    save_json_file(filename, payload)
     return filename
 
 
@@ -896,62 +915,6 @@ def weekly_digest_due(config: dict[str, Any], previous: dict[str, Any] | None, t
     return (previous or {}).get("last_notified_date") != today.isoformat()
 
 
-def runtime_text(minutes: int | None) -> str | None:
-    if not minutes:
-        return None
-    hours, mins = divmod(minutes, 60)
-    if hours and mins:
-        return f"{hours}h {mins}m"
-    if hours:
-        return f"{hours}h"
-    return f"{mins}m"
-
-
-def display_date(value: str | None) -> str | None:
-    parsed = parse_date(value)
-    if not parsed:
-        return value
-    return parsed.strftime("%b %d, %Y")
-
-
-def shorten_text(value: str, limit: int) -> str:
-    if len(value) <= limit:
-        return value
-    return value[: limit - 3].rstrip() + "..."
-
-
-def build_movie_card_caption(movie: MatchedMovie) -> str:
-    title = html.escape(movie.title)
-    year = html.escape(str(movie.year or "n/a"))
-    lines = [
-        f"🎬 <b>{title} ({year})</b>",
-        f"⭐ <b>Letterboxd:</b> {movie.rating:.2f}",
-        "",
-    ]
-
-    if movie.genres:
-        lines.append(f"🎭 {html.escape(' · '.join(movie.genres))}")
-    runtime = runtime_text(movie.runtime_minutes)
-    if runtime:
-        lines.append(f"⏱ {runtime}")
-    release = display_date(movie.theatrical_release_date)
-    if release:
-        lines.append(f"📅 US theatrical: {html.escape(release)}")
-    if len(lines) > 3:
-        lines.append("")
-
-    if movie.overview:
-        lines.extend([html.escape(shorten_text(movie.overview, 260)), ""])
-    if movie.trailer_url:
-        lines.append(f"🎞 Trailer: {html.escape(movie.trailer_url)}")
-    if movie.letterboxd_url:
-        lines.append(f"📍 Letterboxd: {html.escape(movie.letterboxd_url)}")
-    elif movie.tmdb_url:
-        lines.append(f"📍 TMDB: {html.escape(movie.tmdb_url)}")
-
-    return "\n".join(lines).strip()
-
-
 def parse_tgram_url(url: str) -> tuple[str, str] | None:
     if not url.startswith("tgram://"):
         return None
@@ -977,41 +940,8 @@ def telegram_api_request(token: str, method: str, data: dict[str, Any], files: d
     return True
 
 
-def send_telegram_movie_card(token: str, chat_id: str, movie: MatchedMovie) -> bool:
-    caption = build_movie_card_caption(movie)
-    if movie.poster_url:
-        return telegram_api_request(
-            token,
-            "sendPhoto",
-            {
-                "chat_id": chat_id,
-                "photo": movie.poster_url,
-                "caption": caption,
-                "parse_mode": "HTML",
-            },
-        )
-    return telegram_api_request(
-        token,
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": caption,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        },
-    )
-
-
-def send_telegram_notifications(
-    telegram_urls: list[str],
-    body: str,
-    added: list[MatchedMovie],
-    chart_path: str | None,
-) -> bool:
-    """New-film poster cards, then the trend chart, then the digest text.
-
-    The digest goes last so it is what the notification preview shows.
-    """
+def send_telegram_notifications(telegram_urls: list[str], body: str, image_path: str | None) -> bool:
+    """Send the digest image on its own, or the text digest if no image could be rendered."""
     success = True
     for url in telegram_urls:
         parsed = parse_tgram_url(url)
@@ -1020,29 +950,24 @@ def send_telegram_notifications(
             success = False
             continue
         token, chat_id = parsed
-        for movie in added:
-            success = send_telegram_movie_card(token, chat_id, movie) and success
-        if chart_path:
-            with open(chart_path, "rb") as chart:
-                success = telegram_api_request(token, "sendPhoto", {"chat_id": chat_id}, files={"photo": chart}) and success
-        success = (
-            telegram_api_request(
-                token,
-                "sendMessage",
-                {"chat_id": chat_id, "text": body, "parse_mode": "HTML", "disable_web_page_preview": True},
+        if image_path:
+            with open(image_path, "rb") as image:
+                success = telegram_api_request(token, "sendPhoto", {"chat_id": chat_id}, files={"photo": image}) and success
+        else:
+            success = (
+                telegram_api_request(
+                    token,
+                    "sendMessage",
+                    {"chat_id": chat_id, "text": body, "parse_mode": "HTML", "disable_web_page_preview": True},
+                )
+                and success
             )
-            and success
-        )
     return success
 
 
-def send_notification(
-    config: dict[str, Any],
-    body: str,
-    added: list[MatchedMovie] | None = None,
-    chart_path: str | None = None,
-) -> bool:
-    """Send a Telegram-HTML body; non-Telegram Apprise targets get it as plain text."""
+def send_notification(config: dict[str, Any], body: str, image_path: str | None = None) -> bool:
+    """Telegram gets the image alone (or the Telegram-HTML body without one);
+    other Apprise targets get the body as plain text with the image attached."""
     urls = config.get("notifications", {}).get("urls", [])
     if not urls:
         logging.info("No notification URLs configured, skipping notification")
@@ -1053,13 +978,13 @@ def send_notification(
     results = []
 
     if telegram_urls:
-        results.append(send_telegram_notifications(telegram_urls, body, added or [], chart_path))
+        results.append(send_telegram_notifications(telegram_urls, body, image_path))
 
     if apprise_urls:
         apobj = Apprise()
         for url in apprise_urls:
             apobj.add(url)
-        results.append(bool(apobj.notify(body=html_to_text(body))))
+        results.append(bool(apobj.notify(body=html_to_text(body), attach=image_path)))
 
     result = all(results)
     if result:
@@ -1123,6 +1048,7 @@ def run_once(config: dict[str, Any], dry_run_notify: bool = False, notify_latest
     else:
         raise RuntimeError(f"Unsupported source: {source}")
     logging.info("Fetched %d Letterboxd candidates", len(candidates))
+    fetched = candidates
 
     candidates = filter_candidates(candidates, min_rating=min_rating, min_year=min_year)
     logging.info("%d candidates remain after rating/release filters", len(candidates))
@@ -1136,7 +1062,7 @@ def run_once(config: dict[str, Any], dry_run_notify: bool = False, notify_latest
     logging.info("%d movies remain after TMDB theatre filter", len(matches))
 
     print_results(matches)
-    snapshot = save_snapshot(matches, timezone)
+    snapshot = save_snapshot(matches, timezone, fetched)
     logging.info("Saved snapshot to %s", snapshot)
 
     previous = load_json_file(STATE_FILE, None)
@@ -1146,23 +1072,31 @@ def run_once(config: dict[str, Any], dry_run_notify: bool = False, notify_latest
     last_notified = (previous or {}).get("last_notified_date")
 
     def digest(heading: str, new: list[MatchedMovie], gone: list[dict[str, Any]]) -> tuple[str, str | None]:
+        """The text digest, plus the digest image when it can be rendered.
+
+        The text is the fallback: if Chromium is unavailable or rendering
+        fails, the run still notifies instead of failing outright.
+        """
         history = load_history(LOGS_DIR)
-        chart = render_trend_chart(history, [(movie.key, movie.title) for movie in matches], CHART_FILE, today)
-        return build_digest_message(matches, new, gone, history, today, heading), chart
+        message = build_digest_message(matches, new, gone, history, today, heading)
+        try:
+            image = render_digest_image(matches, new, gone, history, today, DIGEST_IMAGE_FILE)
+        except Exception as exc:
+            logging.warning("Could not render digest image, falling back to text: %s", exc)
+            image = None
+        return message, image
 
     if notify_latest:
         # On-demand push of the current state. Deliberately leaves state.json and
         # the notification log untouched so the scheduled alerting carries on
         # exactly as before.
-        message, chart = digest("Letterboxd picks in theatres", [], [])
-        return 0 if send_notification(config, message, chart_path=chart) else 1
+        message, image = digest("Letterboxd picks in theatres", [], [])
+        return 0 if send_notification(config, message, image) else 1
 
     if dry_run_notify:
-        message, chart = digest("Letterboxd picks in theatres", added, removed)
+        message, image = digest("Letterboxd picks in theatres", added, removed)
         print("\n--- Dry-run notification ---")
-        print(html_to_text(message))
-        if chart:
-            print(f"\nChart: {chart}")
+        print(f"Image: {image}" if image else html_to_text(message))
         return 0
 
     if is_unconfirmed_empty(matches, previous):
@@ -1193,8 +1127,8 @@ def run_once(config: dict[str, Any], dry_run_notify: bool = False, notify_latest
         logging.info("Change was already notified")
         return 0
 
-    message, chart = digest("Letterboxd picks in theatres" if changed else "Weekly roundup", added, removed)
-    if send_notification(config, message, added=added, chart_path=chart):
+    message, image = digest("Letterboxd picks in theatres" if changed else "Weekly roundup", added, removed)
+    if send_notification(config, message, image):
         if changed:
             notification_log.append(change_key)
             save_notification_log(notification_log)
@@ -1208,7 +1142,7 @@ def run_once(config: dict[str, Any], dry_run_notify: bool = False, notify_latest
 def main() -> int:
     parser = argparse.ArgumentParser(description="List and monitor high-rated Letterboxd popular movies still in theatres.")
     parser.add_argument("--once", action="store_true", help="Run one check and exit. This is the default behavior.")
-    parser.add_argument("--dry-run-notify", action="store_true", help="Print the notification body without sending or changing state.")
+    parser.add_argument("--dry-run-notify", action="store_true", help="Render the digest image (or print the text fallback) without sending or changing state.")
     parser.add_argument(
         "--notify-latest",
         action="store_true",

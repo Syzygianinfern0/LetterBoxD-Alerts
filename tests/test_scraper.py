@@ -1,6 +1,9 @@
 import unittest
 from datetime import date
+from unittest import mock
 
+import scraper
+from digest_image import digest_html
 from history import days_on_list, film_trend
 from scraper import (
     FilmCandidate,
@@ -285,6 +288,43 @@ class ScraperTests(unittest.TestCase):
         self.assertIn("In theatres since Oct 16 (2 wks)", message)
         self.assertIn("Opens Nov 6", message)
         self.assertIn("👁 5K watched", message)
+
+
+    def test_digest_image_highlights_new_and_dropped_films(self):
+        today = date(2026, 10, 30)
+        history = {
+            date(2026, 10, 28): {"1": {"rating": 4.4, "watches": 1000, "popularity_rank": 5}},
+            date(2026, 10, 29): {"1": {"rating": 4.4, "watches": 1500, "popularity_rank": 4}},
+            date(2026, 10, 30): {"1": {"rating": 4.4, "watches": 2100, "popularity_rank": 3}},
+        }
+        matches = [
+            MatchedMovie("1", "Tracked", 2026, 4.4, None, "2026-10-16", None, None, "ok", popularity_rank=3, watches=2100),
+            MatchedMovie("2", "Brand <New>", 2026, 4.1, None, "2026-11-06", None, None, "ok", watches=50),
+        ]
+        removed = [{"key": "3", "title": "Gone", "rating": 4.02, "popularity_rank": 25}]
+
+        page = digest_html(matches, [matches[1]], removed, history, today)
+
+        self.assertIn("+1 new", page)
+        self.assertIn("−1 left", page)
+        self.assertIn('class="row new"', page)
+        self.assertIn("Brand &lt;New&gt; <span class=\"pill\">NEW</span>", page)
+        self.assertIn("+550</b>/day", page)  # average of the 500 and 600 daily gains available so far
+        self.assertIn("collecting data", page)  # the new film has a single observation
+        self.assertIn("Dropped off", page)
+        self.assertIn("last ⭐ 4.02, #25", page)
+        self.assertIn("Popularity", page)
+
+    def test_telegram_sends_only_the_image_when_rendered(self):
+        with mock.patch.object(scraper, "telegram_api_request", return_value=True) as request, \
+                mock.patch("builtins.open", mock.mock_open(read_data=b"png")):
+            self.assertTrue(scraper.send_telegram_notifications(["tgram://token/42"], "text", "digest.png"))
+        self.assertEqual([call.args[1] for call in request.call_args_list], ["sendPhoto"])
+
+    def test_telegram_falls_back_to_text_without_an_image(self):
+        with mock.patch.object(scraper, "telegram_api_request", return_value=True) as request:
+            self.assertTrue(scraper.send_telegram_notifications(["tgram://token/42"], "text", None))
+        self.assertEqual([call.args[1] for call in request.call_args_list], ["sendMessage"])
 
 
 if __name__ == "__main__":
