@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_requests
 from tabulate import tabulate
 
-from digest_image import render_digest_image
+from digest_image import release_lines, render_digest_image
 from history import FilmTrend, compact_number, film_trend, load_history
 
 
@@ -39,6 +39,10 @@ TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w780"
 RETRY_STATUS_CODES = {403, 408, 429, 500, 502, 503, 504}
 MAX_FETCH_ATTEMPTS = 5
 RETRY_BASE_DELAY = 5.0
+# A later run (re-release, or a limited release going wide) must start this
+# long after the first opening; anything sooner, like an IMAX release a week
+# after opening night, is part of the original run.
+LATER_RUN_MIN_GAP_DAYS = 45
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,6 +72,12 @@ class TheatreStatus:
     tmdb_id: int | None = None
     tmdb_url: str | None = None
     theatrical_release_date: str | None = None
+    first_theatrical_date: str | None = None
+    # Set when the film only qualifies through a later run, e.g. a 4DX
+    # re-release or a limited release going wide: "re-release" or "expansion".
+    current_run: str | None = None
+    current_run_note: str | None = None
+    streaming_since: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +102,10 @@ class MatchedMovie:
     watches: int | None = None
     likes: int | None = None
     lists: int | None = None
+    first_theatrical_date: str | None = None
+    current_run: str | None = None
+    current_run_note: str | None = None
+    streaming_since: str | None = None
 
 
 def load_config(path: str = CONFIG_FILE) -> dict[str, Any]:
@@ -659,11 +673,18 @@ def theatre_status_from_release_dates(
     today: date,
     tmdb_id: int | None = None,
 ) -> TheatreStatus:
+    """Treat a film as in theatres if it has a regional limited (2) or
+    theatrical (3) release inside the window.
+
+    TMDB records when runs start, never when they end, so this is an estimate.
+    The first opening is kept separately so a re-release or wide expansion is
+    not mistaken for the film being new.
+    """
     start = today - timedelta(days=window_days)
     end = today + timedelta(days=future_grace_days)
     region = region.upper()
-    best_date: date | None = None
-    best_type: int | None = None
+    theatrical: list[tuple[date, int, str]] = []
+    digital: list[date] = []
 
     for country in payload.get("results", []):
         if not isinstance(country, dict) or str(country.get("iso_3166_1", "")).upper() != region:
@@ -671,24 +692,37 @@ def theatre_status_from_release_dates(
         for release in country.get("release_dates", []):
             release_type = parse_int(release.get("type"))
             release_date = parse_date(release.get("release_date"))
-            if release_type not in (2, 3) or release_date is None:
+            if release_date is None:
                 continue
-            if start <= release_date <= end and (best_date is None or release_date > best_date):
-                best_date = release_date
-                best_type = release_type
+            if release_type in (2, 3):
+                theatrical.append((release_date, release_type, str(release.get("note") or "").strip()))
+            elif release_type == 4 and release_date <= today:
+                digital.append(release_date)
 
     tmdb_url = f"https://www.themoviedb.org/movie/{tmdb_id}" if tmdb_id else None
-    if best_date:
-        label = "limited theatrical" if best_type == 2 else "theatrical"
-        return TheatreStatus(
-            True,
-            f"{region} {label} release on {best_date.isoformat()}",
-            tmdb_id=tmdb_id,
-            tmdb_url=tmdb_url,
-            theatrical_release_date=best_date.isoformat(),
-        )
+    in_window = [release for release in theatrical if start <= release[0] <= end]
+    if not in_window:
+        return TheatreStatus(False, f"No {region} theatrical release in the configured window", tmdb_id=tmdb_id, tmdb_url=tmdb_url)
 
-    return TheatreStatus(False, f"No {region} theatrical release in the configured window", tmdb_id=tmdb_id, tmdb_url=tmdb_url)
+    best_date, best_type, best_note = max(in_window)
+    first_date = min(theatrical)[0]
+    current_run = None
+    if first_date < start and (best_date - first_date).days > LATER_RUN_MIN_GAP_DAYS:
+        earlier_types = {release_type for release_date, release_type, _ in theatrical if release_date < start}
+        current_run = "expansion" if best_type == 3 and earlier_types == {2} else "re-release"
+
+    label = "limited theatrical" if best_type == 2 else "theatrical"
+    return TheatreStatus(
+        True,
+        f"{region} {label} release on {best_date.isoformat()}",
+        tmdb_id=tmdb_id,
+        tmdb_url=tmdb_url,
+        theatrical_release_date=best_date.isoformat(),
+        first_theatrical_date=first_date.isoformat(),
+        current_run=current_run,
+        current_run_note=(best_note or None) if current_run else None,
+        streaming_since=min(digital).isoformat() if digital else None,
+    )
 
 
 def first_trailer_url(details: dict[str, Any]) -> str | None:
@@ -753,6 +787,10 @@ def build_matches(candidates: list[FilmCandidate], tmdb_client: TMDBClient, filt
                 tmdb_url=status.tmdb_url,
                 theatre_reason=status.reason,
                 popularity_rank=candidate.popularity_rank,
+                first_theatrical_date=status.first_theatrical_date,
+                current_run=status.current_run,
+                current_run_note=status.current_run_note,
+                streaming_since=status.streaming_since,
                 **metadata,
             )
         )
@@ -828,17 +866,6 @@ def signed(value: float, digits: int = 2) -> str:
     return f"{arrow}{abs(value):.{digits}f}"
 
 
-def release_text(movie: MatchedMovie, today: date) -> str | None:
-    released = parse_date(movie.theatrical_release_date)
-    if not released:
-        return None
-    if released > today:
-        return f"Opens {released:%b} {released.day}"
-    weeks = (today - released).days // 7
-    age = f"{weeks} wk" + ("s" if weeks != 1 else "") if weeks else "this week"
-    return f"In theatres since {released:%b} {released.day} ({age})"
-
-
 def digest_film_block(movie: MatchedMovie, trend: FilmTrend, is_new: bool, today: date) -> str:
     title = html.escape(movie.title)
     lines = [f"<b>{title}</b> ({movie.year or 'n/a'})" + (" 🆕" if is_new else "")]
@@ -860,10 +887,10 @@ def digest_film_block(movie: MatchedMovie, trend: FilmTrend, is_new: bool, today
             watches += f", {MOMENTUM_ICONS[trend.momentum]}"
         lines.append(watches)
 
-    release = release_text(movie, today)
+    release = " · ".join(release_lines(movie, today))
     if release:
         on_list = f" · on list {trend.days_on_list}d" if trend.days_on_list > 1 else ""
-        lines.append(f"🎟 {release}{on_list}")
+        lines.append(f"🎟 {html.escape(release)}{on_list}")
 
     links = []
     if movie.letterboxd_url:

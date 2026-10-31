@@ -3,7 +3,7 @@ from datetime import date
 from unittest import mock
 
 import scraper
-from digest_image import digest_html
+from digest_image import digest_html, release_lines
 from history import days_on_list, film_trend
 from scraper import (
     FilmCandidate,
@@ -285,7 +285,7 @@ class ScraperTests(unittest.TestCase):
         self.assertIn("1. <b>Kept</b>", message)
         self.assertIn("2. <b>New &amp; Bold</b> (2026) 🆕", message)
         self.assertIn("👋 Gone left", message)
-        self.assertIn("In theatres since Oct 16 (2 wks)", message)
+        self.assertIn("In theatres 2 wks", message)
         self.assertIn("Opens Nov 6", message)
         self.assertIn("👁 5K watched", message)
 
@@ -325,6 +325,82 @@ class ScraperTests(unittest.TestCase):
         with mock.patch.object(scraper, "telegram_api_request", return_value=True) as request:
             self.assertTrue(scraper.send_telegram_notifications(["tgram://token/42"], "text", None))
         self.assertEqual([call.args[1] for call in request.call_args_list], ["sendMessage"])
+
+
+    def us_releases(self, *releases):
+        return {
+            "results": [
+                {
+                    "iso_3166_1": "US",
+                    "release_dates": [
+                        {"release_date": f"{day}T00:00:00.000Z", "type": kind, "note": note} for day, kind, note in releases
+                    ],
+                }
+            ]
+        }
+
+    def test_theatre_status_marks_rerelease_and_streaming(self):
+        # Obsession's real US dates: opened May 15, streaming from Jun 30, 4DX run Oct 14.
+        payload = self.us_releases(
+            ("2025-09-21", 1, "Fantastic Fest"),
+            ("2026-05-15", 3, ""),
+            ("2026-06-30", 4, ""),
+            ("2026-10-14", 2, "4DX"),
+            ("2026-11-17", 4, "Netflix"),
+        )
+
+        status = theatre_status_from_release_dates(payload, "US", 90, 7, date(2026, 10, 30), tmdb_id=1339713)
+
+        self.assertTrue(status.in_theatres)
+        self.assertEqual(status.theatrical_release_date, "2026-10-14")
+        self.assertEqual(status.first_theatrical_date, "2026-05-15")
+        self.assertEqual(status.current_run, "re-release")
+        self.assertEqual(status.current_run_note, "4DX")
+        self.assertEqual(status.streaming_since, "2026-06-30")  # the future Netflix date is ignored
+
+    def test_theatre_status_marks_limited_release_going_wide_as_expansion(self):
+        payload = self.us_releases(("2026-06-01", 2, ""), ("2026-09-15", 3, ""))
+
+        status = theatre_status_from_release_dates(payload, "US", 90, 7, date(2026, 10, 30))
+
+        self.assertEqual(status.current_run, "expansion")
+        self.assertIsNone(status.current_run_note)
+        self.assertIsNone(status.streaming_since)
+
+    def test_theatre_status_format_release_soon_after_opening_is_not_a_rerelease(self):
+        # Spider-Man: opened Jul 31 (just outside the window), IMAX run from Aug 6.
+        payload = self.us_releases(("2026-07-31", 3, ""), ("2026-08-06", 2, "IMAX"))
+
+        status = theatre_status_from_release_dates(payload, "US", 90, 7, date(2026, 10, 30))
+
+        self.assertTrue(status.in_theatres)
+        self.assertIsNone(status.current_run)
+        self.assertEqual(status.first_theatrical_date, "2026-07-31")
+
+    def test_theatre_status_new_release_is_not_a_later_run(self):
+        payload = self.us_releases(("2026-10-10", 2, ""), ("2026-10-17", 3, ""))
+
+        status = theatre_status_from_release_dates(payload, "US", 90, 7, date(2026, 10, 30))
+
+        self.assertIsNone(status.current_run)
+        self.assertEqual(status.first_theatrical_date, "2026-10-10")
+
+    def test_release_lines_count_from_first_opening(self):
+        today = date(2026, 10, 30)
+
+        def movie(**fields):
+            return MatchedMovie("1", "Film", 2026, 4.1, None, fields.pop("current"), None, None, "ok", **fields)
+
+        self.assertEqual(
+            release_lines(movie(current="2026-10-14", first_theatrical_date="2026-05-15", current_run="re-release", current_run_note="4DX"), today),
+            ["Out 24 wks (opened May 15)", "Back Oct 14: 4DX re-release"],
+        )
+        self.assertEqual(
+            release_lines(movie(current="2026-09-15", first_theatrical_date="2026-06-01", current_run="expansion"), today),
+            ["Out 21 wks (opened Jun 1)", "Went wide Sep 15"],
+        )
+        self.assertEqual(release_lines(movie(current="2026-10-16"), today), ["In theatres 2 wks"])
+        self.assertEqual(release_lines(movie(current="2026-11-06", first_theatrical_date="2026-11-06"), today), ["Opens Nov 6"])
 
 
 if __name__ == "__main__":

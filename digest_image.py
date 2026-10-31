@@ -37,6 +37,7 @@ h1{font-size:26px;font-weight:700;letter-spacing:-.01em}
 .chip.new{color:var(--new);background:rgba(79,155,240,.14)}
 .d{font-size:12px;font-weight:600;font-variant-numeric:tabular-nums}.d.up{color:var(--rise)}.d.down{color:var(--cool)}.d.flat{color:var(--faint)}
 .pill{display:inline-block;font-size:10px;font-weight:800;letter-spacing:.08em;padding:3px 6px;border-radius:4px;vertical-align:2px;background:var(--new);color:#fff}
+.pill.streaming{background:transparent;color:var(--muted);box-shadow:inset 0 0 0 1px var(--faint)}
 .cols,.row{display:grid;grid-template-columns:56px 1fr 62px 120px 78px;gap:12px}
 .cols{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);padding:0 12px 8px;border-bottom:1px solid var(--line)}
 .cols span:nth-child(3),.cols span:nth-child(5){text-align:right}
@@ -65,17 +66,46 @@ h1{font-size:26px;font-weight:700;letter-spacing:-.01em}
 """
 
 
-def release_label(theatrical_release_date: str | None, today: date) -> str | None:
+def short_date(value: date) -> str:
+    return f"{value:%b} {value.day}"
+
+
+def weeks_text(days: int) -> str:
+    weeks = days // 7
+    return f"{weeks} wk" + ("s" if weeks != 1 else "")
+
+
+def parse_iso(value: Any) -> date | None:
     try:
-        released = date.fromisoformat(str(theatrical_release_date)[:10])
+        return date.fromisoformat(str(value)[:10]) if value else None
     except ValueError:
         return None
-    if released > today:
-        return f"Opens {released:%b} {released.day}"
-    weeks = (today - released).days // 7
-    if not weeks:
-        return "Opened this week"
-    return f"In theatres {weeks} wk" + ("s" if weeks != 1 else "")
+
+
+def release_lines(movie: Any, today: date) -> list[str]:
+    """How long the film has been out, counted from its first US opening,
+    plus what put it back in the window if that was a later run."""
+    current = parse_iso(movie.theatrical_release_date)
+    first = parse_iso(getattr(movie, "first_theatrical_date", None)) or current
+    if not current or not first:
+        return []
+    if first > today:
+        return [f"Opens {short_date(first)}"]
+
+    run = getattr(movie, "current_run", None)
+    if not run:
+        days = (today - first).days
+        return ["Opened this week" if days < 7 else f"In theatres {weeks_text(days)}"]
+
+    lines = [f"Out {weeks_text((today - first).days)} (opened {short_date(first)})"]
+    note = getattr(movie, "current_run_note", None) or ""
+    if len(note) > 24:  # long TMDB notes ("Director's cut (4K restoration)") don't fit the row
+        note = ""
+    if run == "expansion":
+        lines.append(f"Went wide {short_date(current)}")
+    else:
+        lines.append(f"Back {short_date(current)}: {note + ' ' if note else ''}re-release")
+    return lines
 
 
 def small_poster(url: str | None) -> str | None:
@@ -121,10 +151,9 @@ def film_row(movie: Any, history: dict[date, dict[str, dict[str, Any]]], is_new:
     ]
 
     title = escape(movie.title) + (' <span class="pill">NEW</span>' if is_new else "")
-    meta = [escape(" · ".join((movie.genres or [])[:2]))]
-    release = release_label(movie.theatrical_release_date, today)
-    if release:
-        meta.append(release)
+    if getattr(movie, "streaming_since", None):
+        title += ' <span class="pill streaming">STREAMING</span>'
+    meta = [escape(" · ".join((movie.genres or [])[:2]))] + [escape(line) for line in release_lines(movie, today)]
 
     if len(gains) >= 2:
         arrow, label, color = MOMENTUM.get(trend.momentum, ("", "", "var(--steady)"))
