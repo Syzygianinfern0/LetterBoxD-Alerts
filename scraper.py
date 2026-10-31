@@ -7,7 +7,7 @@ import random
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -19,12 +19,15 @@ from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_requests
 from tabulate import tabulate
 
+from history import FilmTrend, compact_number, film_trend, load_history, render_trend_chart
+
 
 CONFIG_FILE = "config.yaml"
 ENV_FILE = ".env"
 STATE_FILE = "state.json"
 LOGS_DIR = "logs"
 NOTIFICATION_LOG_FILE = os.path.join(LOGS_DIR, "notifications.json")
+CHART_FILE = os.path.join(LOGS_DIR, "trends.png")
 LETTERBOXD_BASE_URL = "https://api.letterboxd.com/api/v0"
 LETTERBOXD_WEB_URL = "https://letterboxd.com"
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
@@ -54,6 +57,7 @@ class FilmCandidate:
     imdb_id: str | None = None
     release_date: str | None = None
     letterboxd_url: str | None = None
+    popularity_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +85,12 @@ class MatchedMovie:
     runtime_minutes: int | None = None
     overview: str | None = None
     trailer_url: str | None = None
+    # Position in Letterboxd's popular-this-week list (1 = most popular).
+    popularity_rank: int | None = None
+    # Lifetime Letterboxd member counts, recorded daily to track momentum.
+    watches: int | None = None
+    likes: int | None = None
+    lists: int | None = None
 
 
 def load_config(path: str = CONFIG_FILE) -> dict[str, Any]:
@@ -459,7 +469,7 @@ class LetterboxdCSIClient:
         for candidate in page_candidates:
             if candidate.key in seen_keys:
                 continue
-            candidates.append(candidate)
+            candidates.append(replace(candidate, popularity_rank=len(candidates) + 1))
             seen_keys.add(candidate.key)
             if len(candidates) >= candidate_limit:
                 break
@@ -528,23 +538,48 @@ class LetterboxdCSIClient:
                 if tmdb_id is None:
                     match = re.search(r'data-tmdb-id=["\'](\d+)["\']', html)
                     tmdb_id = parse_int(match.group(1)) if match else None
-                hydrated.append(
-                    FilmCandidate(
-                        key=str(tmdb_id or candidate.key),
-                        title=candidate.title,
-                        year=candidate.year,
-                        rating=candidate.rating,
-                        letterboxd_id=candidate.letterboxd_id,
-                        tmdb_id=tmdb_id,
-                        imdb_id=candidate.imdb_id,
-                        release_date=candidate.release_date,
-                        letterboxd_url=candidate.letterboxd_url,
-                    )
-                )
+                hydrated.append(replace(candidate, key=str(tmdb_id or candidate.key), tmdb_id=tmdb_id))
             except Exception as exc:
                 logging.warning("Could not hydrate TMDB ID for %s: %s", candidate.title, exc)
                 hydrated.append(candidate)
         return hydrated
+
+    def fetch_film_stats(self, letterboxd_url: str) -> dict[str, int]:
+        """Lifetime watch/like/list counts from the film's stats fragment."""
+        slug = letterboxd_url.rstrip("/").rsplit("/", 1)[-1]
+        html_text = self.get_text(f"{self.base_url}/csi/film/{slug}/stats/", referer=letterboxd_url)
+        return parse_film_stats(html_text)
+
+    def attach_stats(self, matches: list["MatchedMovie"]) -> list["MatchedMovie"]:
+        enriched = []
+        for movie in matches:
+            if not movie.letterboxd_url:
+                enriched.append(movie)
+                continue
+            try:
+                enriched.append(replace(movie, **self.fetch_film_stats(movie.letterboxd_url)))
+            except Exception as exc:
+                logging.warning("Could not fetch Letterboxd stats for %s: %s", movie.title, exc)
+                enriched.append(movie)
+        return enriched
+
+
+FILM_STAT_PATTERNS = {
+    "watches": r"Watched by ([\d,]+)",
+    "lists": r"Appears in ([\d,]+)",
+    "likes": r"Liked by ([\d,]+)",
+}
+
+
+def parse_film_stats(html_text: str) -> dict[str, int]:
+    soup = BeautifulSoup(html_text, "lxml")
+    labels = " ".join(str(node.get("aria-label", "")) for node in soup.select(".production-statistic"))
+    stats = {}
+    for name, pattern in FILM_STAT_PATTERNS.items():
+        match = re.search(pattern, labels)
+        if match:
+            stats[name] = int(match.group(1).replace(",", ""))
+    return stats
 
 
 class TMDBClient:
@@ -716,6 +751,7 @@ def build_matches(candidates: list[FilmCandidate], tmdb_client: TMDBClient, filt
                 letterboxd_url=candidate.letterboxd_url,
                 tmdb_url=status.tmdb_url,
                 theatre_reason=status.reason,
+                popularity_rank=candidate.popularity_rank,
                 **metadata,
             )
         )
@@ -737,12 +773,15 @@ def save_json_file(path: str, data: Any) -> None:
         json.dump(data, f, indent=2, sort_keys=True)
 
 
-def state_payload(matches: list[MatchedMovie], timezone: str) -> dict[str, Any]:
+def state_payload(matches: list[MatchedMovie], timezone: str, last_notified_date: str | None = None) -> dict[str, Any]:
     now = datetime.now(ZoneInfo(timezone))
-    return {
+    payload: dict[str, Any] = {
         "last_updated": now.isoformat(),
         "movies": [asdict(movie) for movie in matches],
     }
+    if last_notified_date:
+        payload["last_notified_date"] = last_notified_date
+    return payload
 
 
 def save_snapshot(matches: list[MatchedMovie], timezone: str) -> str:
@@ -760,43 +799,101 @@ def save_notification_log(keys: list[str]) -> None:
     save_json_file(NOTIFICATION_LOG_FILE, keys)
 
 
-def movie_line(movie: MatchedMovie | dict[str, Any]) -> str:
-    title = movie.title if isinstance(movie, MatchedMovie) else movie.get("title")
-    rating = movie.rating if isinstance(movie, MatchedMovie) else movie.get("rating")
-    year = movie.year if isinstance(movie, MatchedMovie) else movie.get("year")
-    lb_url = movie.letterboxd_url if isinstance(movie, MatchedMovie) else movie.get("letterboxd_url")
-    tmdb_url = movie.tmdb_url if isinstance(movie, MatchedMovie) else movie.get("tmdb_url")
-    rating_text = f"{float(rating):.2f}" if rating is not None else "n/a"
-    bits = [f"{title} ({year or 'n/a'}) - {rating_text} stars"]
-    if lb_url:
-        bits.append(str(lb_url))
-    elif tmdb_url:
-        bits.append(str(tmdb_url))
-    return " | ".join(bits)
+WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+MOMENTUM_ICONS = {"rising": "↗ rising", "steady": "→ steady", "cooling": "↘ cooling"}
+MAX_DIGEST_FILMS = 15
 
 
-def build_notification_message(added: list[MatchedMovie], removed: list[dict[str, Any]], timezone: str) -> str:
-    now = datetime.now(ZoneInfo(timezone)).strftime("%b %d, %Y %H:%M %Z")
-    lines = ["Letterboxd theatre-filtered movies changed", f"Checked: {now}", ""]
-    if added:
-        lines.append("Added:")
-        lines.extend(f"- {movie_line(movie)}" for movie in added)
-        lines.append("")
-    if removed:
-        lines.append("Removed:")
-        lines.extend(f"- {movie_line(movie)}" for movie in removed)
+def signed(value: float, digits: int = 2) -> str:
+    arrow = "▲" if value > 0 else "▼" if value < 0 else "±"
+    return f"{arrow}{abs(value):.{digits}f}"
+
+
+def release_text(movie: MatchedMovie, today: date) -> str | None:
+    released = parse_date(movie.theatrical_release_date)
+    if not released:
+        return None
+    if released > today:
+        return f"Opens {released:%b} {released.day}"
+    weeks = (today - released).days // 7
+    age = f"{weeks} wk" + ("s" if weeks != 1 else "") if weeks else "this week"
+    return f"In theatres since {released:%b} {released.day} ({age})"
+
+
+def digest_film_block(movie: MatchedMovie, trend: FilmTrend, is_new: bool, today: date) -> str:
+    title = html.escape(movie.title)
+    lines = [f"<b>{title}</b> ({movie.year or 'n/a'})" + (" 🆕" if is_new else "")]
+
+    rating = f"⭐ {movie.rating:.2f}"
+    if trend.rating_change_7d:
+        rating += f" ({signed(trend.rating_change_7d)} wk)"
+    if movie.popularity_rank:
+        rating += f" · 🔥 #{movie.popularity_rank} this week"
+        if trend.rank_change_7d:
+            rating += f" ({signed(trend.rank_change_7d, 0)})"
+    lines.append(rating)
+
+    if movie.watches is not None:
+        watches = f"👁 {compact_number(movie.watches)} watched"
+        if trend.watches_per_day is not None:
+            watches += f" · +{compact_number(trend.watches_per_day)}/day"
+        if trend.momentum:
+            watches += f", {MOMENTUM_ICONS[trend.momentum]}"
+        lines.append(watches)
+
+    release = release_text(movie, today)
+    if release:
+        on_list = f" · on list {trend.days_on_list}d" if trend.days_on_list > 1 else ""
+        lines.append(f"🎟 {release}{on_list}")
+
+    links = []
+    if movie.letterboxd_url:
+        links.append(f'<a href="{html.escape(movie.letterboxd_url)}">Letterboxd</a>')
+    if movie.trailer_url:
+        links.append(f'<a href="{html.escape(movie.trailer_url)}">Trailer</a>')
+    if links:
+        lines.append(" · ".join(links))
+    return "\n".join(lines)
+
+
+def build_digest_message(
+    matches: list[MatchedMovie],
+    added: list[MatchedMovie],
+    removed: list[dict[str, Any]],
+    history: dict[date, dict[str, dict[str, Any]]],
+    today: date,
+    heading: str,
+) -> str:
+    """Telegram-HTML digest of the full current list, with per-film trends."""
+    lines = [f"🎟 <b>{html.escape(heading)}</b> · {today:%b} {today.day}"]
+    changes = [f"🆕 {html.escape(movie.title)}" for movie in added]
+    changes += [f"👋 {html.escape(str(movie.get('title')))} left" for movie in removed]
+    if changes:
+        lines.append(" · ".join(changes))
+    lines.append("")
+
+    if not matches:
+        lines.append("No films currently match the configured constraints.")
+    added_keys = {movie.key for movie in added}
+    for index, movie in enumerate(matches[:MAX_DIGEST_FILMS], start=1):
+        block = digest_film_block(movie, film_trend(history, movie.key, today), movie.key in added_keys, today)
+        lines.extend([f"{index}. {block}", ""])
+    if len(matches) > MAX_DIGEST_FILMS:
+        lines.append(f"…and {len(matches) - MAX_DIGEST_FILMS} more.")
     return "\n".join(lines).strip()
 
 
-def build_latest_message(matches: list[MatchedMovie], timezone: str) -> str:
-    """The current set of matching films, for the on-demand --notify-latest push."""
-    now = datetime.now(ZoneInfo(timezone)).strftime("%b %d, %Y %H:%M %Z")
-    lines = ["Letterboxd theatre-filtered movies (latest)", f"Checked: {now}", ""]
-    if matches:
-        lines.extend(f"- {movie_line(movie)}" for movie in matches)
-    else:
-        lines.append("No movies currently match the configured constraints.")
-    return "\n".join(lines).strip()
+def html_to_text(value: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", value))
+
+
+def weekly_digest_due(config: dict[str, Any], previous: dict[str, Any] | None, today: date) -> bool:
+    weekday = config.get("notifications", {}).get("digest_weekday", "friday")
+    if not weekday or str(weekday).lower() not in WEEKDAYS:
+        return False
+    if WEEKDAYS.index(str(weekday).lower()) != today.weekday():
+        return False
+    return (previous or {}).get("last_notified_date") != today.isoformat()
 
 
 def runtime_text(minutes: int | None) -> str | None:
@@ -868,8 +965,8 @@ def parse_tgram_url(url: str) -> tuple[str, str] | None:
     return token, chat_id
 
 
-def telegram_api_request(token: str, method: str, data: dict[str, Any]) -> bool:
-    response = requests.post(f"https://api.telegram.org/bot{token}/{method}", data=data, timeout=30)
+def telegram_api_request(token: str, method: str, data: dict[str, Any], files: dict[str, Any] | None = None) -> bool:
+    response = requests.post(f"https://api.telegram.org/bot{token}/{method}", data=data, files=files, timeout=30)
     if not response.ok:
         logging.error("Telegram %s failed: HTTP %s %s", method, response.status_code, response.text)
         return False
@@ -909,8 +1006,12 @@ def send_telegram_notifications(
     telegram_urls: list[str],
     body: str,
     added: list[MatchedMovie],
-    removed: list[dict[str, Any]],
+    chart_path: str | None,
 ) -> bool:
+    """New-film poster cards, then the trend chart, then the digest text.
+
+    The digest goes last so it is what the notification preview shows.
+    """
     success = True
     for url in telegram_urls:
         parsed = parse_tgram_url(url)
@@ -919,14 +1020,19 @@ def send_telegram_notifications(
             success = False
             continue
         token, chat_id = parsed
-        if added:
-            for movie in added:
-                success = send_telegram_movie_card(token, chat_id, movie) and success
-            if removed:
-                removed_body = "Removed:\n" + "\n".join(f"- {movie_line(movie)}" for movie in removed)
-                success = telegram_api_request(token, "sendMessage", {"chat_id": chat_id, "text": removed_body}) and success
-        else:
-            success = telegram_api_request(token, "sendMessage", {"chat_id": chat_id, "text": body}) and success
+        for movie in added:
+            success = send_telegram_movie_card(token, chat_id, movie) and success
+        if chart_path:
+            with open(chart_path, "rb") as chart:
+                success = telegram_api_request(token, "sendPhoto", {"chat_id": chat_id}, files={"photo": chart}) and success
+        success = (
+            telegram_api_request(
+                token,
+                "sendMessage",
+                {"chat_id": chat_id, "text": body, "parse_mode": "HTML", "disable_web_page_preview": True},
+            )
+            and success
+        )
     return success
 
 
@@ -934,27 +1040,26 @@ def send_notification(
     config: dict[str, Any],
     body: str,
     added: list[MatchedMovie] | None = None,
-    removed: list[dict[str, Any]] | None = None,
+    chart_path: str | None = None,
 ) -> bool:
+    """Send a Telegram-HTML body; non-Telegram Apprise targets get it as plain text."""
     urls = config.get("notifications", {}).get("urls", [])
     if not urls:
         logging.info("No notification URLs configured, skipping notification")
         return True
 
-    added = added or []
-    removed = removed or []
     telegram_urls = [str(url) for url in urls if str(url).startswith("tgram://")]
     apprise_urls = [str(url) for url in urls if not str(url).startswith("tgram://")]
     results = []
 
     if telegram_urls:
-        results.append(send_telegram_notifications(telegram_urls, body, added, removed))
+        results.append(send_telegram_notifications(telegram_urls, body, added or [], chart_path))
 
     if apprise_urls:
         apobj = Apprise()
         for url in apprise_urls:
             apobj.add(url)
-        results.append(bool(apobj.notify(body=body)))
+        results.append(bool(apobj.notify(body=html_to_text(body))))
 
     result = all(results)
     if result:
@@ -985,6 +1090,18 @@ def print_results(matches: list[MatchedMovie]) -> None:
     print(tabulate(rows, headers="keys", tablefmt="grid"))
 
 
+def is_unconfirmed_empty(matches: list[MatchedMovie], previous: dict[str, Any] | None) -> bool:
+    """A scrape that suddenly matches nothing is far more often a bad page than
+    every film leaving at once, so it has to repeat on the next run to count."""
+    return not matches and bool(previous and previous.get("movies")) and not previous.get("unconfirmed_empty")
+
+
+def already_notified(notification_log: list[str], change_key: str) -> bool:
+    """Only the most recent change counts as a duplicate: a film can leave,
+    return and leave again, and each of those is worth hearing about."""
+    return bool(notification_log) and notification_log[-1] == change_key
+
+
 def run_once(config: dict[str, Any], dry_run_notify: bool = False, notify_latest: bool = False) -> int:
     source = str(config.get("source", "letterboxd_csi"))
     filters = config.get("filters", {})
@@ -1013,6 +1130,8 @@ def run_once(config: dict[str, Any], dry_run_notify: bool = False, notify_latest
         candidates = csi_client.hydrate_tmdb_ids(candidates)
 
     matches = build_matches(candidates, tmdb_client, filters)
+    if source == "letterboxd_csi":
+        matches = csi_client.attach_stats(matches)
     matches = sort_matches(matches, interesting_rating)
     logging.info("%d movies remain after TMDB theatre filter", len(matches))
 
@@ -1023,22 +1142,35 @@ def run_once(config: dict[str, Any], dry_run_notify: bool = False, notify_latest
     previous = load_json_file(STATE_FILE, None)
     added, removed = diff_results(previous, matches)
     first_run = previous is None
+    today = datetime.now(ZoneInfo(timezone)).date()
+    last_notified = (previous or {}).get("last_notified_date")
+
+    def digest(heading: str, new: list[MatchedMovie], gone: list[dict[str, Any]]) -> tuple[str, str | None]:
+        history = load_history(LOGS_DIR)
+        chart = render_trend_chart(history, [(movie.key, movie.title) for movie in matches], CHART_FILE, today)
+        return build_digest_message(matches, new, gone, history, today, heading), chart
 
     if notify_latest:
         # On-demand push of the current state. Deliberately leaves state.json and
-        # the notification log untouched so the scheduled change-only alerting
-        # carries on exactly as before.
-        message = build_latest_message(matches, timezone)
-        if send_notification(config, message, added=matches, removed=[]):
-            return 0
-        return 1
+        # the notification log untouched so the scheduled alerting carries on
+        # exactly as before.
+        message, chart = digest("Letterboxd picks in theatres", [], [])
+        return 0 if send_notification(config, message, chart_path=chart) else 1
 
     if dry_run_notify:
+        message, chart = digest("Letterboxd picks in theatres", added, removed)
         print("\n--- Dry-run notification ---")
-        if added or removed:
-            print(build_notification_message(added, removed, timezone))
-        else:
-            print("No changes detected.")
+        print(html_to_text(message))
+        if chart:
+            print(f"\nChart: {chart}")
+        return 0
+
+    if is_unconfirmed_empty(matches, previous):
+        logging.warning(
+            "No movies matched but %d did last run; keeping state until the next run confirms it",
+            len(previous["movies"]),
+        )
+        save_json_file(STATE_FILE, {**previous, "unconfirmed_empty": True})
         return 0
 
     notify_on_first_run = bool(config.get("notifications", {}).get("notify_on_first_run", False))
@@ -1047,23 +1179,26 @@ def run_once(config: dict[str, Any], dry_run_notify: bool = False, notify_latest
         logging.info("First run: baseline saved without sending a change notification")
         return 0
 
-    if not added and not removed:
-        save_json_file(STATE_FILE, state_payload(matches, timezone))
+    changed = bool(added or removed)
+    weekly = weekly_digest_due(config, previous, today)
+    if not changed and not weekly:
+        save_json_file(STATE_FILE, state_payload(matches, timezone, last_notified))
         logging.info("No changes detected")
         return 0
 
     change_key = "|".join(sorted([f"add:{movie.key}" for movie in added] + [f"remove:{movie['key']}" for movie in removed]))
     notification_log = load_notification_log()
-    if change_key in notification_log:
-        save_json_file(STATE_FILE, state_payload(matches, timezone))
+    if changed and not weekly and already_notified(notification_log, change_key):
+        save_json_file(STATE_FILE, state_payload(matches, timezone, last_notified))
         logging.info("Change was already notified")
         return 0
 
-    message = build_notification_message(added, removed, timezone)
-    if send_notification(config, message, added=added, removed=removed):
-        notification_log.append(change_key)
-        save_notification_log(notification_log)
-        save_json_file(STATE_FILE, state_payload(matches, timezone))
+    message, chart = digest("Letterboxd picks in theatres" if changed else "Weekly roundup", added, removed)
+    if send_notification(config, message, added=added, chart_path=chart):
+        if changed:
+            notification_log.append(change_key)
+            save_notification_log(notification_log)
+        save_json_file(STATE_FILE, state_payload(matches, timezone, today.isoformat()))
         return 0
 
     logging.error("State was not updated because notification failed")

@@ -30,6 +30,9 @@ filters:
 
 notifications:
   notify_on_first_run: false
+  # Also send the full digest once a week even when nothing changed.
+  # Set to null to only notify on changes.
+  digest_weekday: "friday"
   urls:
     - "tgram://<bot_token>/<chat_id>"
 
