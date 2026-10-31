@@ -4,3 +4,5 @@ logs/
 state.json
 __pycache__/
 .pytest_cache/
+.venv/
+.python-version

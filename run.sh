@@ -1,8 +1,13 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -uo pipefail
+
+cd "$(dirname "$0")"
+
+trap 'exit 0' INT TERM
 
 while true; do
-    conda run -n Letterboxd python scraper.py --once
+    uv run python scraper.py --once
 
-    # Wait for 1 day (86400 seconds)
+    # Wait 1 day
     sleep 86400
 done
